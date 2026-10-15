@@ -5,6 +5,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 
 import pymupdf
 import psycopg
@@ -15,7 +16,6 @@ from google import genai
 from google.genai import errors
 from pgvector.psycopg import register_vector
 from pydantic import BaseModel, Field
-from sentence_transformers import SentenceTransformer
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "documents.db"
@@ -36,19 +36,43 @@ app = FastAPI(
     version="0.3.0",
 )
 
+# Keep local development origins and allow the deployed Vercel origin via
+# FRONTEND_URL in Render's environment settings.
+allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+frontend_url = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
+if frontend_url and frontend_url not in allowed_origins:
+    allowed_origins.append(frontend_url)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load once when the API process starts, rather than once per request.
-embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device="cpu")
+# Import PyTorch/Sentence Transformers only when an embedding is first needed.
+# This lets Render's health check bind to its port without loading the model
+# during module import. The model is then cached for later requests.
+_embedding_model = None
+_embedding_model_lock = Lock()
+
+
+def get_embedding_model():
+    global _embedding_model
+    if _embedding_model is None:
+        with _embedding_model_lock:
+            if _embedding_model is None:
+                from sentence_transformers import SentenceTransformer
+                logger.info("Loading embedding model %s", EMBEDDING_MODEL_NAME)
+                _embedding_model = SentenceTransformer(
+                    EMBEDDING_MODEL_NAME,
+                    device="cpu",
+                )
+    return _embedding_model
 
 
 def get_connection():
@@ -77,7 +101,6 @@ initialize_database()
 
 
 def get_postgres_connection():
-  
     required_settings = ["PGHOST", "PGDATABASE", "PGUSER", "PGPASSWORD"]
     missing = [key for key in required_settings if not os.getenv(key)]
     if missing:
@@ -124,7 +147,7 @@ def index_document(document_id: str, filename: str, text: str) -> int:
     if not chunks:
         return 0
 
-    embeddings = embedding_model.encode(
+    embeddings = get_embedding_model().encode(
         chunks,
         batch_size=16,
         normalize_embeddings=True,
@@ -300,7 +323,7 @@ def semantic_search(request: SearchRequest):
     if not query:
         raise HTTPException(status_code=422, detail="Search query cannot be empty.")
 
-    query_embedding = embedding_model.encode(query, normalize_embeddings=True)
+    query_embedding = get_embedding_model().encode(query, normalize_embeddings=True)
 
     try:
         with get_postgres_connection() as connection:
@@ -418,7 +441,7 @@ def ask_question(request: AskRequest):
     if not api_key:
         raise HTTPException(status_code=503, detail="Gemini API key is not configured.")
 
-    query_embedding = embedding_model.encode(question, normalize_embeddings=True)
+    query_embedding = get_embedding_model().encode(question, normalize_embeddings=True)
 
     try:
         with get_postgres_connection() as connection:
