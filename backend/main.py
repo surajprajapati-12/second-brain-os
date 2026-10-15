@@ -36,12 +36,16 @@ app = FastAPI(
     version="0.3.0",
 )
 
+
 # Keep local development origins and allow the deployed Vercel origin via
 # FRONTEND_URL in Render's environment settings.
 allowed_origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "https://second-brain-2egwaycyh-suraj-prajapatis-projects-8e14f2f6.vercel.app",
 ]
+
+# Add FRONTEND_URL from Render if configured.
 frontend_url = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
 if frontend_url and frontend_url not in allowed_origins:
     allowed_origins.append(frontend_url)
@@ -59,6 +63,8 @@ app.add_middleware(
 # during module import. The model is then cached for later requests.
 _embedding_model = None
 _embedding_model_lock = Lock()
+
+
 
 
 def get_embedding_model():
