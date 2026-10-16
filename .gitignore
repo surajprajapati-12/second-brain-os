@@ -1,8 +1,16 @@
+
+# Secrets and environment configuration
 .env
 .env.*
 !.env.example
+
+# Python virtual environments
 .venv/
 .venv*/
+
+# Python cache
 __pycache__/
 *.py[cod]
-git add .gitignore
+
+# Local databases
+*.db
