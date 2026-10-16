@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pymupdf
 import psycopg
+from psycopg.rows import dict_row
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -93,6 +94,7 @@ def generate_embeddings(texts: list[str]) -> list[list[float]]:
         embeddings.append(vector)
 
     return embeddings
+
 
 def get_connection():
     connection = sqlite3.connect(DB_PATH)
@@ -240,6 +242,7 @@ def health_check():
     return {"status": "healthy", "service": "second-brain-api"}
 
 
+
 @app.post("/documents", status_code=201)
 async def upload_document(file: UploadFile = File(...)):
     filename = (file.filename or "").replace("\\", "/").split("/")[-1]
@@ -252,35 +255,66 @@ async def upload_document(file: UploadFile = File(...)):
         )
 
     file_bytes = await file.read(MAX_FILE_SIZE + 1)
+
     if not file_bytes:
         raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+
     if len(file_bytes) > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="File exceeds the 10 MB limit.")
 
     text = extract_text(filename, file_bytes)
     document_id = str(uuid.uuid4())
-    created_at = datetime.now(timezone.utc).isoformat()
+    created_at = datetime.now(timezone.utc)
 
-    # Save the original document first. Indexing errors do not delete it.
-    with get_connection() as connection:
-        connection.execute(
-            """
-            INSERT INTO documents (
-                id, filename, file_type, size_bytes, extracted_text, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (document_id, filename, extension[1:], len(file_bytes), text, created_at),
-        )
+    # Save metadata and extracted text in Neon first.
+    try:
+        with get_postgres_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO public.documents (
+                    id, filename, file_type, size_bytes,
+                    extracted_text, created_at, indexing_status
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, 'pending')
+                """,
+                (
+                    document_id,
+                    filename,
+                    extension[1:],
+                    len(file_bytes),
+                    text,
+                    created_at,
+                ),
+            )
+    except psycopg.Error as exc:
+        logger.exception("Document metadata storage failed")
+        raise HTTPException(
+            status_code=503,
+            detail="Document storage is temporarily unavailable.",
+        ) from exc
 
-    indexing_status = "indexed"
     indexed_chunks = 0
+    indexing_status = "pending"
+
     try:
         indexed_chunks = index_document(document_id, filename, text)
+        indexing_status = "indexed"
     except Exception:
-        # Keep the saved document; log the cause for debugging without exposing
-        # database credentials or internal errors to the API client.
         logger.exception("Indexing failed for document %s", document_id)
-        indexing_status = "pending"
+
+    # Update the indexing status after indexing succeeds or fails.
+    try:
+        with get_postgres_connection() as connection:
+            connection.execute(
+                """
+                UPDATE public.documents
+                SET indexing_status = %s
+                WHERE id = %s
+                """,
+                (indexing_status, document_id),
+            )
+    except psycopg.Error:
+        logger.exception("Could not update indexing status for %s", document_id)
 
     return {
         "id": document_id,
@@ -289,7 +323,7 @@ async def upload_document(file: UploadFile = File(...)):
         "size_bytes": len(file_bytes),
         "text_characters": len(text),
         "preview": text[:300],
-        "created_at": created_at,
+        "created_at": created_at.isoformat(),
         "indexing_status": indexing_status,
         "indexed_chunks": indexed_chunks,
     }
@@ -297,33 +331,166 @@ async def upload_document(file: UploadFile = File(...)):
 
 @app.get("/documents")
 def list_documents():
-    with get_connection() as connection:
-        rows = connection.execute(
-            """
-            SELECT id, filename, file_type, size_bytes, created_at,
-                   length(extracted_text) AS text_characters
-            FROM documents
-            ORDER BY created_at DESC
-            """
-        ).fetchall()
-    return [dict(row) for row in rows]
+    try:
+        with get_postgres_connection() as connection:
+            with connection.cursor(row_factory=dict_row) as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, filename, file_type, size_bytes, created_at,
+                           length(extracted_text) AS text_characters,
+                           indexing_status
+                    FROM public.documents
+                    ORDER BY created_at DESC
+                    """
+                )
+                rows = cursor.fetchall()
+
+        return rows
+
+    except psycopg.Error as exc:
+        logger.exception("Could not list documents")
+        raise HTTPException(
+            status_code=503,
+            detail="Document storage is temporarily unavailable.",
+        ) from exc
 
 
 @app.get("/documents/{document_id}")
 def get_document(document_id: str):
-    with get_connection() as connection:
-        row = connection.execute(
-            """
-            SELECT id, filename, file_type, size_bytes, extracted_text, created_at
-            FROM documents
-            WHERE id = ?
-            """,
-            (document_id,),
-        ).fetchone()
+    try:
+        with get_postgres_connection() as connection:
+            with connection.cursor(row_factory=dict_row) as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, filename, file_type, size_bytes,
+                           extracted_text, created_at, indexing_status
+                    FROM public.documents
+                    WHERE id = %s
+                    """,
+                    (document_id,),
+                )
+                row = cursor.fetchone()
+
+    except psycopg.Error as exc:
+        logger.exception("Could not retrieve document %s", document_id)
+        raise HTTPException(
+            status_code=503,
+            detail="Document storage is temporarily unavailable.",
+        ) from exc
 
     if row is None:
         raise HTTPException(status_code=404, detail="Document not found.")
-    return dict(row)
+
+    return row
+
+
+def retrieve_hybrid_candidates(query: str, query_embedding: list[float], pool_limit: int = 40):
+    """Retrieve a ranked pool using vector similarity + full-text RRF."""
+    sql = """
+        WITH vector_candidates AS (
+            SELECT id,
+                   embedding <=> %s::vector AS distance,
+                   ROW_NUMBER() OVER (
+                       ORDER BY embedding <=> %s::vector, id
+                   ) AS vector_rank
+            FROM document_chunks
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> %s::vector, id
+            LIMIT 20
+        ),
+        keyword_candidates AS (
+            SELECT id,
+                   ROW_NUMBER() OVER (
+                       ORDER BY ts_rank_cd(
+                           to_tsvector('english', chunk_text),
+                           plainto_tsquery('english', %s)
+                       ) DESC, id
+                   ) AS keyword_rank
+            FROM document_chunks
+            WHERE to_tsvector('english', chunk_text)
+                  @@ plainto_tsquery('english', %s)
+            ORDER BY ts_rank_cd(
+                to_tsvector('english', chunk_text),
+                plainto_tsquery('english', %s)
+            ) DESC, id
+            LIMIT 20
+        ),
+        combined AS (
+            SELECT COALESCE(v.id, k.id) AS id,
+                   v.distance,
+                   v.vector_rank,
+                   k.keyword_rank,
+                   COALESCE(1.0 / (60 + v.vector_rank), 0) +
+                   COALESCE(1.0 / (60 + k.keyword_rank), 0) AS hybrid_score
+            FROM vector_candidates v
+            FULL OUTER JOIN keyword_candidates k ON v.id = k.id
+        )
+        SELECT d.document_id, d.filename, d.chunk_index, d.chunk_text,
+               c.distance, c.keyword_rank, c.hybrid_score
+        FROM combined c
+        JOIN document_chunks d ON d.id = c.id
+        ORDER BY c.hybrid_score DESC,
+                 c.distance ASC NULLS LAST,
+                 d.document_id,
+                 d.chunk_index,
+                 c.id
+        LIMIT %s
+    """
+    with get_postgres_connection() as connection:
+        return connection.execute(
+            sql,
+            (query_embedding, query_embedding, query_embedding,
+             query, query, query, pool_limit),
+        ).fetchall()
+
+
+def filter_and_deduplicate_rows(
+    rows,
+    max_cosine_distance: float = 0.65,
+):
+    """Filter weak vector-only matches and deduplicate chunks per document."""
+    kept = []
+    seen = set()
+
+    for row in rows:
+        document_id = row[0]
+        distance = float(row[4]) if row[4] is not None else None
+        keyword_rank = row[5]
+
+        # Keep keyword matches even when they have no vector distance.
+        if (
+            distance is not None
+            and distance > max_cosine_distance
+            and keyword_rank is None
+        ):
+            continue
+
+        text_key = " ".join((row[3] or "").split()).casefold()
+
+        # Ignore empty text and repeated chunks within the same document.
+        dedupe_key = (document_id, text_key)
+
+        if not text_key or dedupe_key in seen:
+            continue
+
+        seen.add(dedupe_key)
+        kept.append(row)
+
+    return kept
+
+def embed_query_or_http_error(query: str) -> list[float]:
+    """Convert expected embedding configuration/provider failures to safe API errors."""
+    try:
+        return generate_embeddings([query])[0]
+    except RuntimeError as exc:
+        message = str(exc)
+        if "GEMINI_API_KEY is not configured" in message:
+            raise HTTPException(status_code=503, detail="Gemini API key is not configured.") from exc
+        logger.exception("Query embedding configuration failed")
+        raise HTTPException(status_code=503, detail="Search service is not configured correctly.") from exc
+    except Exception as exc:
+        logger.exception("Query embedding generation failed")
+        raise HTTPException(status_code=502, detail="Could not create a query embedding. Please retry.") from exc
 
 
 class SearchRequest(BaseModel):
@@ -337,77 +504,9 @@ def semantic_search(request: SearchRequest):
     if not query:
         raise HTTPException(status_code=422, detail="Search query cannot be empty.")
 
-    query_embedding = generate_embeddings([query])[0]
-
+    query_embedding = embed_query_or_http_error(query)
     try:
-        with get_postgres_connection() as connection:
-            rows = connection.execute(
-                """
-                WITH vector_candidates AS (
-                    SELECT
-                        id,
-                        embedding <=> %s::vector AS distance,
-                        ROW_NUMBER() OVER (
-                            ORDER BY embedding <=> %s::vector
-                        ) AS vector_rank
-                    FROM document_chunks
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT 20
-                ),
-                keyword_candidates AS (
-                    SELECT
-                        id,
-                        ROW_NUMBER() OVER (
-                            ORDER BY ts_rank_cd(
-                                to_tsvector('english', chunk_text),
-                                plainto_tsquery('english', %s)
-                            ) DESC
-                        ) AS keyword_rank
-                    FROM document_chunks
-                    WHERE to_tsvector('english', chunk_text)
-                          @@ plainto_tsquery('english', %s)
-                    ORDER BY ts_rank_cd(
-                        to_tsvector('english', chunk_text),
-                        plainto_tsquery('english', %s)
-                    ) DESC
-                    LIMIT 20
-                ),
-                combined AS (
-                    SELECT
-                        COALESCE(v.id, k.id) AS id,
-                        v.distance,
-                        v.vector_rank,
-                        k.keyword_rank,
-                        (
-                            COALESCE(1.0 / (60 + v.vector_rank), 0) +
-                            COALESCE(1.0 / (60 + k.keyword_rank), 0)
-                        ) AS hybrid_score
-                    FROM vector_candidates v
-                    FULL OUTER JOIN keyword_candidates k ON v.id = k.id
-                )
-                SELECT
-                    d.document_id,
-                    d.filename,
-                    d.chunk_index,
-                    d.chunk_text,
-                    c.distance,
-                    c.keyword_rank,
-                    c.hybrid_score
-                FROM combined c
-                JOIN document_chunks d ON d.id = c.id
-                ORDER BY c.hybrid_score DESC
-                LIMIT %s
-                """,
-                (
-                    query_embedding,
-                    query_embedding,
-                    query_embedding,
-                    query,
-                    query,
-                    query,
-                    request.limit,
-                ),
-            ).fetchall()
+        rows = retrieve_hybrid_candidates(query, query_embedding)
     except (psycopg.Error, RuntimeError, ValueError) as exc:
         logger.exception("Hybrid search database operation failed")
         raise HTTPException(
@@ -415,27 +514,23 @@ def semantic_search(request: SearchRequest):
             detail="Search database is unavailable. Check server configuration.",
         ) from exc
 
+    # Fetch a larger candidate pool, then filter and deduplicate before applying limit.
     results = []
-    for row in rows:
+    for row in filter_and_deduplicate_rows(rows):
         distance = float(row[4]) if row[4] is not None else None
-        keyword_rank = row[5]
-
-        # Filter chunks only when they are weak vector matches and have no keyword match.
-        if distance is not None and distance > 0.65 and keyword_rank is None:
-            continue
-
-        results.append(
-            {
-                "document_id": row[0],
-                "filename": row[1],
-                "chunk_index": row[2],
-                "text": row[3],
-                "cosine_distance": round(distance, 4) if distance is not None else None,
-                "similarity_score": round(1.0 - distance, 4) if distance is not None else None,
-                "keyword_rank": keyword_rank,
-                "hybrid_score": round(float(row[6]), 6),
-            }
-        )
+        results.append({
+            "document_id": row[0],
+            "filename": row[1],
+            "chunk_index": row[2],
+            "text": row[3],
+            "cosine_distance": round(distance, 4) if distance is not None else None,
+            # This is a distance-derived score, not a calibrated probability.
+            "similarity_score": round(1.0 - distance, 4) if distance is not None else None,
+            "keyword_rank": row[5],
+            "hybrid_score": round(float(row[6]), 6),
+        })
+        if len(results) >= request.limit:
+            break
 
     return {"query": query, "count": len(results), "results": results}
 
@@ -455,77 +550,9 @@ def ask_question(request: AskRequest):
     if not api_key:
         raise HTTPException(status_code=503, detail="Gemini API key is not configured.")
 
-    query_embedding = generate_embeddings([question])[0]
-
+    query_embedding = embed_query_or_http_error(question)
     try:
-        with get_postgres_connection() as connection:
-            rows = connection.execute(
-                """
-                WITH vector_candidates AS (
-                    SELECT
-                        id,
-                        embedding <=> %s::vector AS distance,
-                        ROW_NUMBER() OVER (
-                            ORDER BY embedding <=> %s::vector
-                        ) AS vector_rank
-                    FROM document_chunks
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT 20
-                ),
-                keyword_candidates AS (
-                    SELECT
-                        id,
-                        ROW_NUMBER() OVER (
-                            ORDER BY ts_rank_cd(
-                                to_tsvector('english', chunk_text),
-                                plainto_tsquery('english', %s)
-                            ) DESC
-                        ) AS keyword_rank
-                    FROM document_chunks
-                    WHERE to_tsvector('english', chunk_text)
-                          @@ plainto_tsquery('english', %s)
-                    ORDER BY ts_rank_cd(
-                        to_tsvector('english', chunk_text),
-                        plainto_tsquery('english', %s)
-                    ) DESC
-                    LIMIT 20
-                ),
-                combined AS (
-                    SELECT
-                        COALESCE(v.id, k.id) AS id,
-                        v.distance,
-                        v.vector_rank,
-                        k.keyword_rank,
-                        (
-                            COALESCE(1.0 / (60 + v.vector_rank), 0) +
-                            COALESCE(1.0 / (60 + k.keyword_rank), 0)
-                        ) AS hybrid_score
-                    FROM vector_candidates v
-                    FULL OUTER JOIN keyword_candidates k ON v.id = k.id
-                )
-                SELECT
-                    d.document_id,
-                    d.filename,
-                    d.chunk_index,
-                    d.chunk_text,
-                    c.distance,
-                    c.keyword_rank,
-                    c.hybrid_score
-                FROM combined c
-                JOIN document_chunks d ON d.id = c.id
-                ORDER BY c.hybrid_score DESC
-                LIMIT %s
-                """,
-                (
-                    query_embedding,
-                    query_embedding,
-                    query_embedding,
-                    question,
-                    question,
-                    question,
-                    request.limit,
-                ),
-            ).fetchall()
+        rows = retrieve_hybrid_candidates(question, query_embedding)
     except (psycopg.Error, RuntimeError, ValueError) as exc:
         logger.exception("Hybrid retrieval database operation failed")
         raise HTTPException(
@@ -533,19 +560,12 @@ def ask_question(request: AskRequest):
             detail="Could not retrieve document context. Check database configuration.",
         ) from exc
 
+    rows = filter_and_deduplicate_rows(rows)[:request.limit]
     for row in rows:
         logger.info(
             "Ask retrieval candidate: filename=%s, chunk_index=%s, cosine_distance=%s, keyword_rank=%s, hybrid_score=%s",
             row[1], row[2], row[4], row[5], row[6],
         )
-
-    # Keep a chunk if either its vector distance is acceptable or keyword search matched it.
-    max_cosine_distance = 0.65
-    rows = [
-        row for row in rows
-        if (row[4] is not None and float(row[4]) <= max_cosine_distance)
-        or row[5] is not None
-    ]
 
     if not rows:
         return {
@@ -563,17 +583,15 @@ def ask_question(request: AskRequest):
             f"Source: {filename}\nDocument ID: {document_id}\n"
             f"Chunk: {chunk_index}\nContent:\n{chunk_text}"
         )
-        sources.append(
-            {
-                "document_id": document_id,
-                "filename": filename,
-                "chunk_index": chunk_index,
-                "text": chunk_text,
-                "similarity_score": round(1.0 - distance, 4) if distance is not None else None,
-                "keyword_rank": row[5],
-                "hybrid_score": round(float(row[6]), 6),
-            }
-        )
+        sources.append({
+            "document_id": document_id,
+            "filename": filename,
+            "chunk_index": chunk_index,
+            "text": chunk_text,
+            "similarity_score": round(1.0 - distance, 4) if distance is not None else None,
+            "keyword_rank": row[5],
+            "hybrid_score": round(float(row[6]), 6),
+        })
 
     context = "\n\n---\n\n".join(context_parts)
     prompt = f"""You are the AI assistant for a personal knowledge system.
