@@ -42,11 +42,12 @@ app = FastAPI(
 allowed_origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "https://second-brain-os-six.vercel.app",
     "https://second-brain-2egwaycyh-suraj-prajapatis-projects-8e14f2f6.vercel.app",
 ]
 
-# Add FRONTEND_URL from Render if configured.
 frontend_url = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
+
 if frontend_url and frontend_url not in allowed_origins:
     allowed_origins.append(frontend_url)
 
