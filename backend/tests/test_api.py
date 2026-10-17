@@ -390,3 +390,39 @@ def test_upload_closes_file_after_validation_error(monkeypatch):
 
     assert response.status_code == 400
     assert captured["file"].file.closed
+# ---------------------------------------------------------------------------
+# Indexing failure recovery
+# ---------------------------------------------------------------------------
+
+@patch("backend.main.get_postgres_connection")
+def test_upload_keeps_document_pending_when_indexing_fails(
+    mock_db,
+    monkeypatch,
+):
+    mock_db.return_value = make_fake_database([])
+
+    def fail_indexing(*args, **kwargs):
+        raise RuntimeError("Simulated embedding service failure")
+
+    monkeypatch.setattr(main, "index_document", fail_indexing)
+
+    response = client.post(
+        "/documents",
+        files={
+            "file": (
+                "pending-test.txt",
+                b"This document should remain saved if indexing fails.",
+                "text/plain",
+            )
+        },
+    )
+
+    assert response.status_code == 201
+
+    data = response.json()
+    assert data["filename"] == "pending-test.txt"
+    assert data["indexing_status"] == "pending"
+    assert data["indexed_chunks"] == 0
+
+    # Metadata storage and indexing-status update are both attempted.
+    assert mock_db.call_count == 2
