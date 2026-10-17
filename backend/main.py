@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+from psycopg_pool import ConnectionPool
 import logging
 import os
 import sqlite3
@@ -33,12 +35,18 @@ EMBEDDING_DIMENSIONS = 384
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("second_brain")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        yield
+    finally:
+        global _postgres_pool
+        if _postgres_pool is not None:
+            _postgres_pool.close()
+            _postgres_pool = None
 
-app = FastAPI(
-    title="Second Brain OS API",
-    description="Your personal AI knowledge system",
-    version="0.3.0",
-)
+
+app = FastAPI(lifespan=lifespan)
 
 # Keep local development origins and allow the deployed Vercel origin via
 # FRONTEND_URL in Render's environment settings.
@@ -120,8 +128,45 @@ def initialize_database():
 
 initialize_database()
 
+_postgres_pool = None
+
+
+def get_postgres_pool():
+    global _postgres_pool
+
+    if _postgres_pool is None:
+        required = ["PGHOST", "PGDATABASE", "PGUSER", "PGPASSWORD"]
+        missing = [key for key in required if not os.getenv(key)]
+
+        if missing:
+            raise RuntimeError(
+                "PostgreSQL configuration is incomplete."
+            )
+
+        _postgres_pool = ConnectionPool(
+            conninfo=psycopg.conninfo.make_conninfo(
+                "",
+                host=os.environ["PGHOST"],
+                port=int(os.getenv("PGPORT", "5432")),
+                dbname=os.environ["PGDATABASE"],
+                user=os.environ["PGUSER"],
+                password=os.environ["PGPASSWORD"],
+                sslmode="require",
+                connect_timeout=5,
+            ),
+            min_size=1,
+            max_size=5,
+            timeout=10,
+            open=False,
+            configure=register_vector,
+        )
+
+        _postgres_pool.open()
+
+    return _postgres_pool
 
 def get_postgres_connection():
+    return get_postgres_pool().connection()
     required_settings = ["PGHOST", "PGDATABASE", "PGUSER", "PGPASSWORD"]
     missing = [key for key in required_settings if not os.getenv(key)]
     if missing:
@@ -436,12 +481,34 @@ def retrieve_hybrid_candidates(query: str, query_embedding: list[float], pool_li
                  c.id
         LIMIT %s
     """
+
+    connection_start = time.perf_counter()
     with get_postgres_connection() as connection:
-        return connection.execute(
+        connection_seconds = time.perf_counter() - connection_start
+
+        query_start = time.perf_counter()
+        rows = connection.execute(
             sql,
-            (query_embedding, query_embedding, query_embedding,
-             query, query, query, pool_limit),
+            (
+                query_embedding,
+                query_embedding,
+                query_embedding,
+                query,
+                query,
+                query,
+                pool_limit,
+            ),
         ).fetchall()
+        query_seconds = time.perf_counter() - query_start
+
+    logger.info(
+        "Database breakdown: connection_setup=%.3fs sql_execution=%.3fs rows=%d",
+        connection_seconds,
+        query_seconds,
+        len(rows),
+    )
+    return rows
+
 
 
 
@@ -457,6 +524,7 @@ def filter_and_deduplicate_rows(
     """
     kept = []
     seen = set()
+
 
     for row in rows:
         document_id = row[0]
@@ -519,16 +587,28 @@ def semantic_search(request: SearchRequest):
             detail="Search query cannot be empty.",
         )
 
-    query_embedding = embed_query_or_http_error(query)
 
+    embedding_start = time.perf_counter()
+    query_embedding = embed_query_or_http_error(query)
+    embedding_seconds = time.perf_counter() - embedding_start
+
+    search_start = time.perf_counter()
     try:
         rows = retrieve_hybrid_candidates(query, query_embedding)
+        database_search_seconds = time.perf_counter() - search_start
     except (psycopg.Error, RuntimeError, ValueError) as exc:
+        database_search_seconds = time.perf_counter() - search_start
         logger.exception("Hybrid search database operation failed")
         raise HTTPException(
             status_code=503,
             detail="Search database is unavailable. Check server configuration.",
         ) from exc
+
+    logger.info(
+        "Search timing: embedding=%.3fs database_search=%.3fs",
+        embedding_seconds,
+        database_search_seconds,
+    )
 
     filtered_rows = filter_and_deduplicate_rows(rows)
 
@@ -573,6 +653,7 @@ class AskRequest(BaseModel):
 
 
 @app.post("/ask")
+
 def ask_question(request: AskRequest):
     question = request.question.strip()
     if not question:
@@ -621,6 +702,7 @@ def ask_question(request: AskRequest):
 
         # Display each document only once.
         # Rows are ranked, so the first chunk is the highest-ranked one.
+
         if document_id in seen_source_ids:
             continue
 
