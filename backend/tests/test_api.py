@@ -502,3 +502,67 @@ def test_upload_successfully_saves_and_indexes_document(
 
     # One database operation saves metadata; another updates its status.
     assert mock_db.call_count == 2
+def test_ask_returns_fallback_when_no_relevant_chunks_exist(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-api-key")
+
+    monkeypatch.setattr(
+        main,
+        "embed_query_or_http_error",
+        lambda _: FAKE_EMBEDDING,
+    )
+    monkeypatch.setattr(
+        main,
+        "retrieve_hybrid_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+
+    with patch("backend.main.genai.Client") as mock_genai:
+        response = client.post(
+            "/ask",
+            json={
+                "question": "What is the secret launch code?",
+                "limit": 5,
+            },
+        )
+
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["question"] == "What is the secret launch code?"
+    assert data["answer"] == (
+        "I couldn't find any indexed document content to answer this question."
+    )
+    assert data["sources"] == []
+
+    # Gemini must not be called when retrieval returns no results.
+    mock_genai.assert_not_called()
+def test_ask_returns_502_when_gemini_fails(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-api-key")
+
+    monkeypatch.setattr(
+        main,
+        "embed_query_or_http_error",
+        lambda _: FAKE_EMBEDDING,
+    )
+    monkeypatch.setattr(
+        main,
+        "retrieve_hybrid_candidates",
+        lambda *_args, **_kwargs: [FAKE_ROW],
+    )
+
+    fake_client = MagicMock()
+    fake_client.models.generate_content.side_effect = RuntimeError(
+        "Internal Gemini failure details"
+    )
+    monkeypatch.setattr(main.genai, "Client", lambda **_: fake_client)
+
+    response = client.post(
+        "/ask",
+        json={"question": "What is the secret code?", "limit": 5},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == (
+        "Gemini could not generate an answer. Please retry shortly."
+    )
+    assert "Internal Gemini failure details" not in response.text
