@@ -1,4 +1,5 @@
-
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { useEffect, useState } from "react";
 import "./App.css";
 
@@ -46,9 +47,9 @@ type AskResponse = {
 
 function App() {
   const [chatQuestion, setChatQuestion] = useState("");
-const [asking, setAsking] = useState(false);
-const [chatError, setChatError] = useState("");
-const [chatResponse, setChatResponse] = useState<AskResponse | null>(null);
+  const [asking, setAsking] = useState(false);
+  const [chatError, setChatError] = useState("");
+  const [chatResponse, setChatResponse] = useState<AskResponse | null>(null);
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [selected, setSelected] = useState<DocumentDetail | null>(null);
   const [loading, setLoading] = useState(true);
@@ -56,9 +57,9 @@ const [chatResponse, setChatResponse] = useState<AskResponse | null>(null);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [query, setQuery] = useState("");
-const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
-const [searching, setSearching] = useState(false);
-const [searchMessage, setSearchMessage] = useState("");
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [searchMessage, setSearchMessage] = useState("");
 
   async function loadDocuments() {
     try {
@@ -156,97 +157,97 @@ const [searchMessage, setSearchMessage] = useState("");
       );
     }
   }
-async function handleSearch(event: React.FormEvent<HTMLFormElement>) {
-  event.preventDefault();
+  async function handleSearch(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
 
-  const trimmedQuery = query.trim();
+    const trimmedQuery = query.trim();
 
-  if (!trimmedQuery) {
-    setSearchMessage("Enter a question to search your knowledge base.");
-    setSearchResults([]);
-    return;
-  }
-
-  setSearching(true);
-  setSearchMessage("");
-  setError("");
-  setSelected(null);
-
-  try {
-    const response = await fetch(`${API_URL}/search`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        query: trimmedQuery,
-        limit: 5,
-      }),
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      throw new Error(data.detail || "Search failed.");
+    if (!trimmedQuery) {
+      setSearchMessage("Enter a question to search your knowledge base.");
+      setSearchResults([]);
+      return;
     }
 
-    const result: SearchResponse = data;
-    setSearchResults(result.results);
+    setSearching(true);
+    setSearchMessage("");
+    setError("");
+    setSelected(null);
 
-    if (result.count === 0) {
-      setSearchMessage("No matching document chunks found.");
+    try {
+      const response = await fetch(`${API_URL}/search`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          query: trimmedQuery,
+          limit: 5,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail || "Search failed.");
+      }
+
+      const result: SearchResponse = data;
+      setSearchResults(result.results);
+
+      if (result.count === 0) {
+        setSearchMessage("No matching document chunks found.");
+      }
+    } catch (err) {
+      setSearchMessage(
+        err instanceof Error ? err.message : "Could not search documents.",
+      );
+    } finally {
+      setSearching(false);
     }
-  } catch (err) {
-    setSearchMessage(
-      err instanceof Error ? err.message : "Could not search documents.",
-    );
-  } finally {
-    setSearching(false);
   }
-}
-async function handleAsk(event: React.FormEvent<HTMLFormElement>) {
-  event.preventDefault();
+  async function handleAsk(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
 
-  const question = chatQuestion.trim();
+    const question = chatQuestion.trim();
 
-  if (!question) {
-    setChatError("Please enter a question.");
-    return;
-  }
-
-  setAsking(true);
-  setChatError("");
-  setChatResponse(null);
-
-  try {
-    const response = await fetch(`${API_URL}/ask`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        question,
-        limit: 5,
-      }),
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      throw new Error(data.detail || "Could not generate an answer.");
+    if (!question) {
+      setChatError("Please enter a question.");
+      return;
     }
 
-    setChatResponse(data as AskResponse);
-  } catch (err) {
-    setChatError(
-      err instanceof Error
-        ? err.message
-        : "Could not connect to the AI service."
-    );
-  } finally {
-    setAsking(false);
+    setAsking(true);
+    setChatError("");
+    setChatResponse(null);
+
+    try {
+      const response = await fetch(`${API_URL}/ask`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          question,
+          limit: 5,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail || "Could not generate an answer.");
+      }
+
+      setChatResponse(data as AskResponse);
+    } catch (err) {
+      setChatError(
+        err instanceof Error
+          ? err.message
+          : "Could not connect to the AI service."
+      );
+    } finally {
+      setAsking(false);
+    }
   }
-}
 
   function formatSize(bytes: number) {
     return bytes < 1024
@@ -300,164 +301,168 @@ async function handleAsk(event: React.FormEvent<HTMLFormElement>) {
               />
             </label>
           </section>
-          
-<section className="library-panel search-panel">
-  <div className="panel-heading">
-    <div>
-      <p className="eyebrow">AI-POWERED RETRIEVAL</p>
-      <h2>Search your knowledge</h2>
-      <p>Ask a question to find relevant passages in your documents.</p>
-    </div>
-  </div>
 
-  <form className="search-form" onSubmit={handleSearch}>
-    <input
-      className="search-input"
-      type="text"
-      value={query}
-      onChange={(event) => setQuery(event.target.value)}
-      placeholder="Ask something, e.g. Who is Rahul?"
-      maxLength={2000}
-      aria-label="Search your knowledge"
-    />
-    <button
-      className="upload-button"
-      type="submit"
-      disabled={searching}
-    >
-      {searching ? "Searching..." : "Search"}
-    </button>
-  </form>
+          <section className="library-panel search-panel">
+            <div className="panel-heading">
+              <div>
+                <p className="eyebrow">AI-POWERED RETRIEVAL</p>
+                <h2>Search your knowledge</h2>
+                <p>Ask a question to find relevant passages in your documents.</p>
+              </div>
+            </div>
 
-  {searchMessage && (
-    <p className="search-message" role="status">
-      {searchMessage}
-    </p>
-  )}
-
-  {searchResults.length > 0 && (
-    <div className="search-results">
-      <h3>Relevant passages ({searchResults.length})</h3>
-
-      {searchResults.map((result, index) => (
-        <article
-          className="search-result"
-          key={`${result.document_id}-${result.chunk_index}`}
-        >
-          <div className="search-result-heading">
-            <strong>{index + 1}. {result.filename}</strong>
-            <span>
-              Distance: {result.cosine_distance.toFixed(4)}
-            </span>
-          </div>
-
-          <p>{result.text}</p>
-
-          <button
-            className="refresh-button"
-            type="button"
-            onClick={() => void openDocument(result.document_id)}
-          >
-            Open original document
-          </button>
-        </article>
-      ))}
-    </div>
-  )}
-</section>
-
-
-<section className="library-panel chat-panel">
-  <div className="panel-heading">
-    <div>
-      <p className="eyebrow">RETRIEVAL-AUGMENTED GENERATION</p>
-      <h2>Chat with your knowledge</h2>
-      <p>Ask questions and get answers grounded in your documents.</p>
-    </div>
-    <span className="chat-badge">AI · RAG</span>
-  </div>
-
-  <form className="chat-form" onSubmit={handleAsk}>
-    <textarea
-      className="chat-input"
-      value={chatQuestion}
-      onChange={(event) => setChatQuestion(event.target.value)}
-      placeholder="Ask your documents anything..."
-      maxLength={2000}
-      rows={3}
-      aria-label="Question for AI"
-      disabled={asking}
-    />
-
-    <div className="chat-form-footer">
-      <span>Answers include supporting document sources.</span>
-      <button
-        className="upload-button"
-        type="submit"
-        disabled={asking || !chatQuestion.trim()}
-      >
-        {asking ? "Thinking..." : "Ask AI ↗"}
-      </button>
-    </div>
-  </form>
-
-  {asking && (
-    <div className="chat-loading" role="status">
-      <span className="loading-dot" />
-      Searching your knowledge and generating an answer...
-    </div>
-  )}
-
-  {chatError && (
-    <div className="notice error" role="alert">
-      {chatError}
-    </div>
-  )}
-
-  {chatResponse && (
-    <div className="chat-answer">
-      <p className="eyebrow">ANSWER</p>
-      <h3>{chatResponse.question}</h3>
-      <div className="answer-text">{chatResponse.answer}</div>
-
-      <div className="source-section">
-        <h3>Sources ({chatResponse.sources.length})</h3>
-
-        {chatResponse.sources.length === 0 ? (
-          <p className="source-empty">
-            No indexed sources were returned for this answer.
-          </p>
-        ) : (
-          chatResponse.sources.map((source) => (
-            <details
-              className="source-card"
-              key={`${source.document_id}-${source.chunk_index}`}
-            >
-              <summary>
-                <span className="source-file-icon">DOC</span>
-                <span className="source-file-name">{source.filename}</span>
-                <span className="source-score">
-                  {(source.similarity_score * 100).toFixed(1)}%
-                </span>
-              </summary>
-
-              <p>{source.text}</p>
-
+            <form className="search-form" onSubmit={handleSearch}>
+              <input
+                className="search-input"
+                type="text"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="Ask something, e.g. Who is Rahul?"
+                maxLength={2000}
+                aria-label="Search your knowledge"
+              />
               <button
-                className="refresh-button"
-                type="button"
-                onClick={() => void openDocument(source.document_id)}
+                className="upload-button"
+                type="submit"
+                disabled={searching}
               >
-                Open original document
+                {searching ? "Searching..." : "Search"}
               </button>
-            </details>
-          ))
-        )}
-      </div>
-    </div>
-  )}
-</section>
- 
+            </form>
+
+            {searchMessage && (
+              <p className="search-message" role="status">
+                {searchMessage}
+              </p>
+            )}
+
+            {searchResults.length > 0 && (
+              <div className="search-results">
+                <h3>Relevant passages ({searchResults.length})</h3>
+
+                {searchResults.map((result, index) => (
+                  <article
+                    className="search-result"
+                    key={`${result.document_id}-${result.chunk_index}`}
+                  >
+                    <div className="search-result-heading">
+                      <strong>{index + 1}. {result.filename}</strong>
+                      <span>
+                        Distance: {result.cosine_distance.toFixed(4)}
+                      </span>
+                    </div>
+
+                    <p>{result.text}</p>
+
+                    <button
+                      className="refresh-button"
+                      type="button"
+                      onClick={() => void openDocument(result.document_id)}
+                    >
+                      Open original document
+                    </button>
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
+
+
+          <section className="library-panel chat-panel">
+            <div className="panel-heading">
+              <div>
+                <p className="eyebrow">RETRIEVAL-AUGMENTED GENERATION</p>
+                <h2>Chat with your knowledge</h2>
+                <p>Ask questions and get answers grounded in your documents.</p>
+              </div>
+              <span className="chat-badge">AI · RAG</span>
+            </div>
+
+            <form className="chat-form" onSubmit={handleAsk}>
+              <textarea
+                className="chat-input"
+                value={chatQuestion}
+                onChange={(event) => setChatQuestion(event.target.value)}
+                placeholder="Ask your documents anything..."
+                maxLength={2000}
+                rows={3}
+                aria-label="Question for AI"
+                disabled={asking}
+              />
+
+              <div className="chat-form-footer">
+                <span>Answers include supporting document sources.</span>
+                <button
+                  className="upload-button"
+                  type="submit"
+                  disabled={asking || !chatQuestion.trim()}
+                >
+                  {asking ? "Thinking..." : "Ask AI ↗"}
+                </button>
+              </div>
+            </form>
+
+            {asking && (
+              <div className="chat-loading" role="status">
+                <span className="loading-dot" />
+                Searching your knowledge and generating an answer...
+              </div>
+            )}
+
+            {chatError && (
+              <div className="notice error" role="alert">
+                {chatError}
+              </div>
+            )}
+
+            {chatResponse && (
+              <div className="chat-answer">
+                <p className="eyebrow">ANSWER</p>
+                <h3>{chatResponse.question}</h3>
+                <div className="answer-text">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {chatResponse.answer}
+                  </ReactMarkdown>
+                </div>
+
+                <div className="source-section">
+                  <h3>Sources ({chatResponse.sources.length})</h3>
+
+                  {chatResponse.sources.length === 0 ? (
+                    <p className="source-empty">
+                      No indexed sources were returned for this answer.
+                    </p>
+                  ) : (
+                    chatResponse.sources.map((source) => (
+                      <details
+                        className="source-card"
+                        key={`${source.document_id}-${source.chunk_index}`}
+                      >
+
+                        <summary>
+                          <span className="source-file-icon">DOC</span>
+                          <span className="source-file-name">{source.filename}</span>
+                          <span className="source-label">Retrieved source</span>
+                        </summary>
+
+
+                        <p>{source.text}</p>
+
+                        <button
+                          className="refresh-button"
+                          type="button"
+                          onClick={() => void openDocument(source.document_id)}
+                        >
+                          Open original document
+                        </button>
+                      </details>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+          </section>
+
 
           {error && <div className="notice error">{error}</div>}
           {message && <div className="notice success">{message}</div>}
@@ -498,9 +503,8 @@ async function handleAsk(event: React.FormEvent<HTMLFormElement>) {
               <div className="document-list">
                 {documents.map((doc) => (
                   <button
-                    className={`document-row ${
-                      selected?.id === doc.id ? "selected" : ""
-                    }`}
+                    className={`document-row ${selected?.id === doc.id ? "selected" : ""
+                      }`}
                     key={doc.id}
                     onClick={() => void openDocument(doc.id)}
                   >

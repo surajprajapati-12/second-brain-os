@@ -398,23 +398,23 @@ def retrieve_hybrid_candidates(query: str, query_embedding: list[float], pool_li
             ORDER BY embedding <=> %s::vector, id
             LIMIT 20
         ),
-        keyword_candidates AS (
-            SELECT id,
-                   ROW_NUMBER() OVER (
-                       ORDER BY ts_rank_cd(
-                           to_tsvector('english', chunk_text),
-                           plainto_tsquery('english', %s)
-                       ) DESC, id
-                   ) AS keyword_rank
-            FROM document_chunks
-            WHERE to_tsvector('english', chunk_text)
-                  @@ plainto_tsquery('english', %s)
-            ORDER BY ts_rank_cd(
-                to_tsvector('english', chunk_text),
-                plainto_tsquery('english', %s)
-            ) DESC, id
-            LIMIT 20
-        ),
+       keyword_candidates AS (
+    SELECT id,
+           ROW_NUMBER() OVER (
+               ORDER BY ts_rank_cd(
+                   to_tsvector('english', chunk_text),
+                   websearch_to_tsquery('english', %s)
+               ) DESC, id
+           ) AS keyword_rank
+    FROM document_chunks
+    WHERE to_tsvector('english', chunk_text)
+          @@ websearch_to_tsquery('english', %s)
+    ORDER BY ts_rank_cd(
+        to_tsvector('english', chunk_text),
+        websearch_to_tsquery('english', %s)
+    ) DESC, id
+    LIMIT 20
+),
         combined AS (
             SELECT COALESCE(v.id, k.id) AS id,
                    v.distance,
@@ -444,20 +444,31 @@ def retrieve_hybrid_candidates(query: str, query_embedding: list[float], pool_li
         ).fetchall()
 
 
+
 def filter_and_deduplicate_rows(
     rows,
-    max_cosine_distance: float = 0.65,
+    max_cosine_distance: float = 0.25,
 ):
-    """Filter weak vector-only matches and deduplicate chunks per document."""
+    """
+    Remove empty, weak vector-only, and duplicate chunks.
+
+    Rows are expected to be ordered by hybrid retrieval score.
+    Keyword matches can survive without a vector distance.
+    """
     kept = []
     seen = set()
 
     for row in rows:
         document_id = row[0]
+        text = " ".join((row[3] or "").split())
         distance = float(row[4]) if row[4] is not None else None
         keyword_rank = row[5]
 
-        # Keep keyword matches even when they have no vector distance.
+        # Ignore chunks without usable text.
+        if not text:
+            continue
+
+        # Reject weak vector-only matches, but preserve keyword matches.
         if (
             distance is not None
             and distance > max_cosine_distance
@@ -465,18 +476,17 @@ def filter_and_deduplicate_rows(
         ):
             continue
 
-        text_key = " ".join((row[3] or "").split()).casefold()
+        # Deduplicate identical text within the same document.
+        dedupe_key = (document_id, text.casefold())
 
-        # Ignore empty text and repeated chunks within the same document.
-        dedupe_key = (document_id, text_key)
-
-        if not text_key or dedupe_key in seen:
+        if dedupe_key in seen:
             continue
 
         seen.add(dedupe_key)
         kept.append(row)
 
     return kept
+
 
 def embed_query_or_http_error(query: str) -> list[float]:
     """Convert expected embedding configuration/provider failures to safe API errors."""
@@ -498,13 +508,19 @@ class SearchRequest(BaseModel):
     limit: int = Field(default=5, ge=1, le=10)
 
 
+
 @app.post("/search")
 def semantic_search(request: SearchRequest):
     query = request.query.strip()
+
     if not query:
-        raise HTTPException(status_code=422, detail="Search query cannot be empty.")
+        raise HTTPException(
+            status_code=422,
+            detail="Search query cannot be empty.",
+        )
 
     query_embedding = embed_query_or_http_error(query)
+
     try:
         rows = retrieve_hybrid_candidates(query, query_embedding)
     except (psycopg.Error, RuntimeError, ValueError) as exc:
@@ -514,25 +530,41 @@ def semantic_search(request: SearchRequest):
             detail="Search database is unavailable. Check server configuration.",
         ) from exc
 
-    # Fetch a larger candidate pool, then filter and deduplicate before applying limit.
+    filtered_rows = filter_and_deduplicate_rows(rows)
+
+    logger.info(
+        "Search diagnostics: query=%r, retrieved=%d, retained=%d",
+        query,
+        len(rows),
+        len(filtered_rows),
+    )
+
     results = []
-    for row in filter_and_deduplicate_rows(rows):
+
+    for row in filtered_rows[:request.limit]:
         distance = float(row[4]) if row[4] is not None else None
+
         results.append({
             "document_id": row[0],
             "filename": row[1],
             "chunk_index": row[2],
             "text": row[3],
-            "cosine_distance": round(distance, 4) if distance is not None else None,
-            # This is a distance-derived score, not a calibrated probability.
-            "similarity_score": round(1.0 - distance, 4) if distance is not None else None,
+            "cosine_distance": (
+                round(distance, 4) if distance is not None else None
+            ),
+            "similarity_score": (
+                round(1.0 - distance, 4)
+                if distance is not None else None
+            ),
             "keyword_rank": row[5],
             "hybrid_score": round(float(row[6]), 6),
         })
-        if len(results) >= request.limit:
-            break
 
-    return {"query": query, "count": len(results), "results": results}
+    return {
+        "query": query,
+        "count": len(results),
+        "results": results,
+    }
 
 
 class AskRequest(BaseModel):
@@ -573,25 +605,39 @@ def ask_question(request: AskRequest):
             "answer": "I couldn't find any indexed document content to answer this question.",
             "sources": [],
         }
-
     context_parts = []
     sources = []
+    seen_source_ids = set()
+
     for row in rows:
         document_id, filename, chunk_index, chunk_text = row[:4]
         distance = float(row[4]) if row[4] is not None else None
+
+        # Keep every retrieved chunk available to the answer generator.
         context_parts.append(
             f"Source: {filename}\nDocument ID: {document_id}\n"
             f"Chunk: {chunk_index}\nContent:\n{chunk_text}"
         )
+
+        # Display each document only once.
+        # Rows are ranked, so the first chunk is the highest-ranked one.
+        if document_id in seen_source_ids:
+            continue
+
+        seen_source_ids.add(document_id)
         sources.append({
             "document_id": document_id,
             "filename": filename,
             "chunk_index": chunk_index,
             "text": chunk_text,
-            "similarity_score": round(1.0 - distance, 4) if distance is not None else None,
+            "similarity_score": (
+                round(1.0 - distance, 4)
+                if distance is not None else None
+            ),
             "keyword_rank": row[5],
             "hybrid_score": round(float(row[6]), 6),
         })
+
 
     context = "\n\n---\n\n".join(context_parts)
     prompt = f"""You are the AI assistant for a personal knowledge system.

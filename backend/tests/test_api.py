@@ -1,63 +1,17 @@
 
-import pytest
-from fastapi.testclient import TestClient
-
-from backend.main import app
-
-
-client = TestClient(app)
-
-
-def test_health_returns_200():
-    response = client.get("/health")
-
-    assert response.status_code == 200
-    assert response.json()["status"] == "healthy"
-
-
-def test_search_rejects_empty_query():
-    response = client.post(
-        "/search",
-        json={"query": "", "limit": 5},
-    )
-
-    assert response.status_code == 422
-
-
-def test_search_rejects_limit_above_maximum():
-    response = client.post(
-        "/search",
-        json={
-            "query": "What does phoenix-test.txt say?",
-            "limit": 11,
-        },
-    )
-
-    assert response.status_code == 422
-
-
-def test_ask_rejects_empty_question():
-    response = client.post(
-        "/ask",
-        json={"question": "", "limit": 5},
-    )
-
-    assert response.status_code == 422
-
-
-def test_ask_rejects_limit_above_maximum():
-    response = client.post(
-        "/ask",
-        json={
-            "question": "What does phoenix-test.txt say?",
-            "limit": 11,
-        },
-    )
-
-    assert response.status_code == 422
-
 from unittest.mock import MagicMock, patch
 
+from fastapi.testclient import TestClient
+
+import backend.main as main
+from backend.main import app, filter_and_deduplicate_rows
+
+
+# ---------------------------------------------------------------------------
+# Test configuration and reusable fixtures
+# ---------------------------------------------------------------------------
+
+client = TestClient(app)
 
 FAKE_EMBEDDING = [0.1] * 384
 
@@ -73,10 +27,77 @@ FAKE_ROW = (
 
 
 def make_fake_database(rows):
+    """Create a mock PostgreSQL connection returning the supplied rows."""
     connection = MagicMock()
     connection.__enter__.return_value.execute.return_value.fetchall.return_value = rows
     return connection
 
+
+def make_search_row(
+    document_id,
+    filename,
+    chunk_index,
+    text,
+    distance,
+    keyword_rank,
+    hybrid_score=0.01,
+):
+    """Create a row matching the hybrid retrieval query's output schema."""
+    return (
+        document_id,
+        filename,
+        chunk_index,
+        text,
+        distance,
+        keyword_rank,
+        hybrid_score,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Health and request validation
+# ---------------------------------------------------------------------------
+
+def test_health_returns_200():
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "healthy"
+
+
+def test_search_rejects_empty_query():
+    response = client.post("/search", json={"query": "", "limit": 5})
+
+    assert response.status_code == 422
+
+
+def test_search_rejects_limit_above_maximum():
+    response = client.post(
+        "/search",
+        json={"query": "test query", "limit": 11},
+    )
+
+    assert response.status_code == 422
+
+
+def test_ask_rejects_empty_question():
+    response = client.post("/ask", json={"question": "", "limit": 5})
+
+    assert response.status_code == 422
+
+
+def test_ask_rejects_limit_above_maximum():
+    response = client.post(
+        "/ask",
+        json={"question": "test question", "limit": 11},
+    )
+
+    assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Search endpoint
+# ---------------------------------------------------------------------------
 
 @patch("backend.main.get_postgres_connection")
 @patch("backend.main.generate_embeddings")
@@ -98,7 +119,13 @@ def test_search_returns_relevant_document(mock_embeddings, mock_db):
     assert data["count"] == 1
     assert data["results"][0]["filename"] == "phoenix-test.txt"
     assert "blue comet" in data["results"][0]["text"]
+    assert data["results"][0]["similarity_score"] is not None
+    assert data["results"][0]["hybrid_score"] == FAKE_ROW[6]
 
+
+# ---------------------------------------------------------------------------
+# Ask endpoint
+# ---------------------------------------------------------------------------
 
 @patch("backend.main.genai.Client")
 @patch("backend.main.get_postgres_connection")
@@ -131,31 +158,85 @@ def test_ask_returns_answer_and_sources(
     assert response.status_code == 200
 
     data = response.json()
+    assert data["question"] == "What does phoenix-test.txt say?"
     assert "blue comet" in data["answer"]
     assert len(data["sources"]) >= 1
     assert data["sources"][0]["filename"] == "phoenix-test.txt"
-from backend.main import filter_and_deduplicate_rows
 
 
-def make_search_row(
-    document_id,
-    filename,
-    chunk_index,
-    text,
-    distance,
-    keyword_rank,
-    hybrid_score=0.01,
+def test_ask_deduplicates_displayed_sources_but_keeps_all_context(
+    monkeypatch,
 ):
-    return (
-        document_id,
-        filename,
-        chunk_index,
-        text,
-        distance,
-        keyword_rank,
-        hybrid_score,
+    """One source card per document, while Gemini receives both chunks."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-api-key")
+
+    rows = [
+        make_search_row(
+            "doc-1",
+            "orion.txt",
+            0,
+            "Project Orion uses a silver eagle.",
+            0.10,
+            1,
+            0.03,
+        ),
+        make_search_row(
+            "doc-1",
+            "orion.txt",
+            1,
+            "The silver eagle is the internal launch code.",
+            0.15,
+            2,
+            0.02,
+        ),
+    ]
+
+    monkeypatch.setattr(
+        main,
+        "embed_query_or_http_error",
+        lambda _: FAKE_EMBEDDING,
+    )
+    monkeypatch.setattr(
+        main,
+        "retrieve_hybrid_candidates",
+        lambda *_args, **_kwargs: rows,
     )
 
+    captured = {}
+
+    fake_client = MagicMock()
+
+    def fake_generate_content(*, model, contents):
+        captured["prompt"] = contents
+        response = MagicMock()
+        response.text = "Project Orion's code is a silver eagle."
+        return response
+
+    fake_client.models.generate_content.side_effect = fake_generate_content
+    monkeypatch.setattr(main.genai, "Client", lambda **_: fake_client)
+
+    response = client.post(
+        "/ask",
+        json={"question": "What is Project Orion's code?", "limit": 5},
+    )
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    # Both chunks are available to Gemini as answer context.
+    assert "Project Orion uses a silver eagle." in captured["prompt"]
+    assert "The silver eagle is the internal launch code." in captured["prompt"]
+
+    # The displayed source list contains the document only once.
+    assert len(data["sources"]) == 1
+    assert data["sources"][0]["document_id"] == "doc-1"
+    assert data["sources"][0]["filename"] == "orion.txt"
+
+
+# ---------------------------------------------------------------------------
+# Retrieval filtering and deduplication helpers
+# ---------------------------------------------------------------------------
 
 def test_deduplication_removes_repeated_chunks_within_document():
     rows = [
@@ -200,3 +281,47 @@ def test_deduplication_keeps_keyword_match_without_vector_distance():
 
     assert len(results) == 1
     assert results[0][3] == "Keyword match"
+def test_deduplication_filters_unrelated_vector_only_match():
+    row = make_search_row(
+        "doc-rahul",
+        "My name is Rahul!.txt",
+        0,
+        "I like learning new things every day.",
+        0.3655,
+        None,
+    )
+
+    results = filter_and_deduplicate_rows([row])
+
+    assert results == []
+
+
+def test_deduplication_keeps_relevant_paraphrase_match():
+    row = make_search_row(
+        "doc-orion",
+        "neon-upload-test.txt",
+        0,
+        "Project Orion uses a silver eagle as its internal launch code.",
+        0.1396,
+        None,
+    )
+
+    results = filter_and_deduplicate_rows([row])
+
+    assert len(results) == 1
+    assert results[0][1] == "neon-upload-test.txt"
+
+
+def test_deduplication_keeps_keyword_match_above_threshold():
+    row = make_search_row(
+        "doc-contact",
+        "Suraj_Prajapati_Resume.pdf",
+        0,
+        "Contact information is available in the resume.",
+        0.3655,
+        1,
+    )
+
+    results = filter_and_deduplicate_rows([row])
+
+    assert len(results) == 1
