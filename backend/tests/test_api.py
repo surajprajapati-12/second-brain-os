@@ -462,3 +462,43 @@ def test_index_document_rejects_embedding_count_mismatch(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Embedding count mismatch"):
         main.index_document("test-document-id", "test.txt", "Some text")
+@patch("backend.main.get_postgres_connection")
+def test_upload_successfully_saves_and_indexes_document(
+    mock_db,
+    monkeypatch,
+):
+    mock_db.return_value = make_fake_database([])
+
+    indexed = {}
+
+    def fake_index_document(document_id, filename, text):
+        indexed["document_id"] = document_id
+        indexed["filename"] = filename
+        indexed["text"] = text
+        return 2
+
+    monkeypatch.setattr(main, "index_document", fake_index_document)
+
+    content = b"Second Brain OS integration test document."
+
+    response = client.post(
+        "/documents",
+        files={"file": ("integration.txt", content, "text/plain")},
+    )
+
+    assert response.status_code == 201
+
+    data = response.json()
+    assert data["filename"] == "integration.txt"
+    assert data["file_type"] == "txt"
+    assert data["size_bytes"] == len(content)
+    assert data["indexing_status"] == "indexed"
+    assert data["indexed_chunks"] == 2
+
+    # The indexing function receives the extracted document text.
+    assert indexed["document_id"] == data["id"]
+    assert indexed["filename"] == "integration.txt"
+    assert indexed["text"] == content.decode("utf-8")
+
+    # One database operation saves metadata; another updates its status.
+    assert mock_db.call_count == 2
