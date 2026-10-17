@@ -426,3 +426,27 @@ def test_upload_keeps_document_pending_when_indexing_fails(
 
     # Metadata storage and indexing-status update are both attempted.
     assert mock_db.call_count == 2
+@patch("backend.main.get_postgres_connection")
+def test_upload_returns_503_when_metadata_storage_fails(mock_db):
+    mock_db.return_value.__enter__.return_value.execute.side_effect = (
+        main.psycopg.OperationalError("Simulated database outage")
+    )
+
+    response = client.post(
+        "/documents",
+        files={
+            "file": (
+                "database-failure.txt",
+                b"This document cannot be stored.",
+                "text/plain",
+            )
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "Document storage is temporarily unavailable."
+    )
+
+    # Indexing must not run if metadata storage fails.
+    assert mock_db.call_count == 1
