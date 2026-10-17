@@ -566,3 +566,52 @@ def test_ask_returns_502_when_gemini_fails(monkeypatch):
         "Gemini could not generate an answer. Please retry shortly."
     )
     assert "Internal Gemini failure details" not in response.text
+@patch("backend.main.get_postgres_connection")
+def test_index_document_chunks_embeds_and_saves_chunks(
+    mock_db,
+    monkeypatch,
+):
+    text = "A" * (main.CHUNK_SIZE + 100)
+    fake_embedding = [0.1] * main.EMBEDDING_DIMENSIONS
+
+    embedding_calls = []
+
+    def fake_generate_embeddings(chunks):
+        embedding_calls.extend(chunks)
+        return [fake_embedding.copy() for _ in chunks]
+
+    monkeypatch.setattr(main, "generate_embeddings", fake_generate_embeddings)
+
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    mock_db.return_value.__enter__.return_value = connection
+
+    indexed_chunks = main.index_document(
+        "integration-document-id",
+        "integration.txt",
+        text,
+    )
+
+    expected_chunks = main.split_text(text)
+
+    assert indexed_chunks == len(expected_chunks)
+    assert indexed_chunks >= 2
+    assert embedding_calls == expected_chunks
+
+    # The old chunks are deleted before the replacement chunks are inserted.
+    executed_sql = [call.args[0] for call in cursor.execute.call_args_list]
+    assert "DELETE FROM document_chunks WHERE document_id = %s" in executed_sql[0]
+
+    insert_calls = [
+        call for call in cursor.execute.call_args_list
+        if "INSERT INTO document_chunks" in call.args[0]
+    ]
+    assert len(insert_calls) == len(expected_chunks)
+
+    for index, call in enumerate(insert_calls):
+        params = call.args[1]
+        assert params[0] == "integration-document-id"
+        assert params[1] == "integration.txt"
+        assert params[2] == index
+        assert params[3] == expected_chunks[index]
+        assert params[4] == fake_embedding
