@@ -325,3 +325,68 @@ def test_deduplication_keeps_keyword_match_above_threshold():
     results = filter_and_deduplicate_rows([row])
 
     assert len(results) == 1
+# ---------------------------------------------------------------------------
+# Document upload regression tests
+# ---------------------------------------------------------------------------
+
+def test_upload_rejects_unsupported_extension():
+    response = client.post(
+        "/documents",
+        files={"file": ("notes.exe", b"some content", "application/octet-stream")},
+    )
+
+    assert response.status_code == 415
+
+
+def test_upload_rejects_empty_file():
+    response = client.post(
+        "/documents",
+        files={"file": ("empty.txt", b"", "text/plain")},
+    )
+
+    assert response.status_code == 400
+
+
+def test_upload_rejects_oversized_file():
+    oversized_content = b"x" * (main.MAX_FILE_SIZE + 1)
+
+    response = client.post(
+        "/documents",
+        files={"file": ("large.txt", oversized_content, "text/plain")},
+    )
+
+    assert response.status_code == 413
+
+
+def test_upload_closes_file_after_validation_error(monkeypatch):
+    original_extract_text = main.extract_text
+    captured = {}
+
+    def capture_file_and_raise(filename, file_bytes):
+        raise main.HTTPException(
+            status_code=400,
+            detail="Simulated extraction failure",
+        )
+
+    # Capture the UploadFile passed to the endpoint by wrapping its read method.
+    from starlette.datastructures import UploadFile
+
+    original_read = UploadFile.read
+
+    async def tracked_read(upload_file, *args, **kwargs):
+        captured["file"] = upload_file
+        return await original_read(upload_file, *args, **kwargs)
+
+    monkeypatch.setattr(UploadFile, "read", tracked_read)
+    monkeypatch.setattr(main, "extract_text", capture_file_and_raise)
+
+    try:
+        response = client.post(
+            "/documents",
+            files={"file": ("notes.txt", b"valid text", "text/plain")},
+        )
+    finally:
+        monkeypatch.setattr(main, "extract_text", original_extract_text)
+
+    assert response.status_code == 400
+    assert captured["file"].file.closed
