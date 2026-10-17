@@ -288,90 +288,102 @@ def health_check():
 
 
 
+
 @app.post("/documents", status_code=201)
 async def upload_document(file: UploadFile = File(...)):
-    filename = (file.filename or "").replace("\\", "/").split("/")[-1]
-    extension = Path(filename).suffix.lower()
-
-    if not filename or extension not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=415,
-            detail="Supported formats are PDF, TXT, and Markdown.",
-        )
-
-    file_bytes = await file.read(MAX_FILE_SIZE + 1)
-
-    if not file_bytes:
-        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
-
-    if len(file_bytes) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="File exceeds the 10 MB limit.")
-
-    text = extract_text(filename, file_bytes)
-    document_id = str(uuid.uuid4())
-    created_at = datetime.now(timezone.utc)
-
-    # Save metadata and extracted text in Neon first.
     try:
-        with get_postgres_connection() as connection:
-            connection.execute(
-                """
-                INSERT INTO public.documents (
-                    id, filename, file_type, size_bytes,
-                    extracted_text, created_at, indexing_status
+        filename = (file.filename or "").replace("\\", "/").split("/")[-1]
+        extension = Path(filename).suffix.lower()
+
+        if not filename or extension not in ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=415,
+                detail="Supported formats are PDF, TXT, and Markdown.",
+            )
+
+        file_bytes = await file.read(MAX_FILE_SIZE + 1)
+
+        if not file_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded file is empty.",
+            )
+
+        if len(file_bytes) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail="File exceeds the 10 MB limit.",
+            )
+
+        text = extract_text(filename, file_bytes)
+        document_id = str(uuid.uuid4())
+        created_at = datetime.now(timezone.utc)
+
+        # Save metadata and extracted text before indexing.
+        try:
+            with get_postgres_connection() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO public.documents (
+                        id, filename, file_type, size_bytes,
+                        extracted_text, created_at, indexing_status
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, 'pending')
+                    """,
+                    (
+                        document_id,
+                        filename,
+                        extension[1:],
+                        len(file_bytes),
+                        text,
+                        created_at,
+                    ),
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, 'pending')
-                """,
-                (
-                    document_id,
-                    filename,
-                    extension[1:],
-                    len(file_bytes),
-                    text,
-                    created_at,
-                ),
+        except psycopg.Error as exc:
+            logger.exception("Document metadata storage failed")
+            raise HTTPException(
+                status_code=503,
+                detail="Document storage is temporarily unavailable.",
+            ) from exc
+
+        indexed_chunks = 0
+        indexing_status = "pending"
+
+        try:
+            indexed_chunks = index_document(document_id, filename, text)
+            indexing_status = "indexed"
+        except Exception:
+            logger.exception("Indexing failed for document %s", document_id)
+
+        # Record the indexing result.
+        try:
+            with get_postgres_connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE public.documents
+                    SET indexing_status = %s
+                    WHERE id = %s
+                    """,
+                    (indexing_status, document_id),
+                )
+        except psycopg.Error:
+            logger.exception(
+                "Could not update indexing status for document %s",
+                document_id,
             )
-    except psycopg.Error as exc:
-        logger.exception("Document metadata storage failed")
-        raise HTTPException(
-            status_code=503,
-            detail="Document storage is temporarily unavailable.",
-        ) from exc
+            indexing_status = "pending"
 
-    indexed_chunks = 0
-    indexing_status = "pending"
+        return {
+            "id": document_id,
+            "filename": filename,
+            "file_type": extension[1:],
+            "size_bytes": len(file_bytes),
+            "indexing_status": indexing_status,
+            "indexed_chunks": indexed_chunks,
+        }
 
-    try:
-        indexed_chunks = index_document(document_id, filename, text)
-        indexing_status = "indexed"
-    except Exception:
-        logger.exception("Indexing failed for document %s", document_id)
-
-    # Update the indexing status after indexing succeeds or fails.
-    try:
-        with get_postgres_connection() as connection:
-            connection.execute(
-                """
-                UPDATE public.documents
-                SET indexing_status = %s
-                WHERE id = %s
-                """,
-                (indexing_status, document_id),
-            )
-    except psycopg.Error:
-        logger.exception("Could not update indexing status for %s", document_id)
-
-    return {
-        "id": document_id,
-        "filename": filename,
-        "file_type": extension[1:],
-        "size_bytes": len(file_bytes),
-        "text_characters": len(text),
-        "preview": text[:300],
-        "created_at": created_at.isoformat(),
-        "indexing_status": indexing_status,
-        "indexed_chunks": indexed_chunks,
-    }
+    finally:
+        await file.close()
 
 
 @app.get("/documents")
