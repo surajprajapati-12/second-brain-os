@@ -207,22 +207,34 @@ def split_text(text: str) -> list[str]:
     return chunks
 
 
+
 def index_document(document_id: str, filename: str, text: str) -> int:
-    """Generate embeddings and replace this document's chunks in PostgreSQL."""
+    """Generate embeddings and atomically replace a document's chunks."""
     chunks = split_text(text)
     if not chunks:
         return 0
 
     embeddings = generate_embeddings(chunks)
 
-    # The transaction means old chunks are replaced only if all inserts succeed.
+    # Never write partial indexing results.
+    if len(embeddings) != len(chunks):
+        raise RuntimeError(
+            f"Embedding count mismatch: expected {len(chunks)}, "
+            f"received {len(embeddings)}."
+        )
+
+    # Keep deletion and insertion in one transaction.
+    # If an insert fails, the previous chunks remain intact.
     with get_postgres_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 "DELETE FROM document_chunks WHERE document_id = %s",
                 (document_id,),
             )
-            for chunk_index, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+
+            for chunk_index, (chunk, embedding) in enumerate(
+                zip(chunks, embeddings)
+            ):
                 cursor.execute(
                     """
                     INSERT INTO document_chunks (
@@ -233,6 +245,7 @@ def index_document(document_id: str, filename: str, text: str) -> int:
                 )
 
     return len(chunks)
+
 
 
 def extract_text(filename: str, file_bytes: bytes) -> str:

@@ -1,4 +1,4 @@
-
+import pytest
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
@@ -450,3 +450,15 @@ def test_upload_returns_503_when_metadata_storage_fails(mock_db):
 
     # Indexing must not run if metadata storage fails.
     assert mock_db.call_count == 1
+def test_index_document_rejects_embedding_count_mismatch(monkeypatch):
+    chunks = ["First chunk", "Second chunk"]
+
+    monkeypatch.setattr(main, "split_text", lambda _: chunks)
+    monkeypatch.setattr(
+        main,
+        "generate_embeddings",
+        lambda _: [[0.1] * main.EMBEDDING_DIMENSIONS],
+    )
+
+    with pytest.raises(RuntimeError, match="Embedding count mismatch"):
+        main.index_document("test-document-id", "test.txt", "Some text")
