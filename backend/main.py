@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+from psycopg_pool import ConnectionPool
 import logging
 import os
 import sqlite3
@@ -33,12 +35,18 @@ EMBEDDING_DIMENSIONS = 384
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("second_brain")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        yield
+    finally:
+        global _postgres_pool
+        if _postgres_pool is not None:
+            _postgres_pool.close()
+            _postgres_pool = None
 
-app = FastAPI(
-    title="Second Brain OS API",
-    description="Your personal AI knowledge system",
-    version="0.3.0",
-)
+
+app = FastAPI(lifespan=lifespan)
 
 # Keep local development origins and allow the deployed Vercel origin via
 # FRONTEND_URL in Render's environment settings.
@@ -120,28 +128,45 @@ def initialize_database():
 
 initialize_database()
 
+_postgres_pool = None
 
-def get_postgres_connection():
-    required_settings = ["PGHOST", "PGDATABASE", "PGUSER", "PGPASSWORD"]
-    missing = [key for key in required_settings if not os.getenv(key)]
-    if missing:
-        raise RuntimeError(
-            "PostgreSQL configuration is incomplete. Check backend/.env."
+
+def get_postgres_pool():
+    global _postgres_pool
+
+    if _postgres_pool is None:
+        required = ["PGHOST", "PGDATABASE", "PGUSER", "PGPASSWORD"]
+        missing = [key for key in required if not os.getenv(key)]
+
+        if missing:
+            raise RuntimeError(
+                "PostgreSQL configuration is incomplete."
+            )
+
+        _postgres_pool = ConnectionPool(
+            conninfo=psycopg.conninfo.make_conninfo(
+                "",
+                host=os.environ["PGHOST"],
+                port=int(os.getenv("PGPORT", "5432")),
+                dbname=os.environ["PGDATABASE"],
+                user=os.environ["PGUSER"],
+                password=os.environ["PGPASSWORD"],
+                sslmode="require",
+                connect_timeout=5,
+            ),
+            min_size=1,
+            max_size=5,
+            timeout=10,
+            open=False,
+            configure=register_vector,
         )
 
-    connection = psycopg.connect(
-        host=os.environ["PGHOST"],
-        port=int(os.getenv("PGPORT", "5432")),
-        dbname=os.environ["PGDATABASE"],
-        user=os.environ["PGUSER"],
-        password=os.environ["PGPASSWORD"],
-        connect_timeout=5,
-        sslmode="require",
-    )
-    register_vector(connection)
-    return connection
+        _postgres_pool.open()
 
+    return _postgres_pool
 
+def get_postgres_connection():
+    return get_postgres_pool().connection()
 def split_text(text: str) -> list[str]:
     """Split text into overlapping character-based chunks."""
     text = text.strip()
@@ -162,22 +187,34 @@ def split_text(text: str) -> list[str]:
     return chunks
 
 
+
 def index_document(document_id: str, filename: str, text: str) -> int:
-    """Generate embeddings and replace this document's chunks in PostgreSQL."""
+    """Generate embeddings and atomically replace a document's chunks."""
     chunks = split_text(text)
     if not chunks:
         return 0
 
     embeddings = generate_embeddings(chunks)
 
-    # The transaction means old chunks are replaced only if all inserts succeed.
+    # Never write partial indexing results.
+    if len(embeddings) != len(chunks):
+        raise RuntimeError(
+            f"Embedding count mismatch: expected {len(chunks)}, "
+            f"received {len(embeddings)}."
+        )
+
+    # Keep deletion and insertion in one transaction.
+    # If an insert fails, the previous chunks remain intact.
     with get_postgres_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 "DELETE FROM document_chunks WHERE document_id = %s",
                 (document_id,),
             )
-            for chunk_index, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+
+            for chunk_index, (chunk, embedding) in enumerate(
+                zip(chunks, embeddings)
+            ):
                 cursor.execute(
                     """
                     INSERT INTO document_chunks (
@@ -188,6 +225,7 @@ def index_document(document_id: str, filename: str, text: str) -> int:
                 )
 
     return len(chunks)
+
 
 
 def extract_text(filename: str, file_bytes: bytes) -> str:
@@ -243,90 +281,102 @@ def health_check():
 
 
 
+
 @app.post("/documents", status_code=201)
 async def upload_document(file: UploadFile = File(...)):
-    filename = (file.filename or "").replace("\\", "/").split("/")[-1]
-    extension = Path(filename).suffix.lower()
-
-    if not filename or extension not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=415,
-            detail="Supported formats are PDF, TXT, and Markdown.",
-        )
-
-    file_bytes = await file.read(MAX_FILE_SIZE + 1)
-
-    if not file_bytes:
-        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
-
-    if len(file_bytes) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="File exceeds the 10 MB limit.")
-
-    text = extract_text(filename, file_bytes)
-    document_id = str(uuid.uuid4())
-    created_at = datetime.now(timezone.utc)
-
-    # Save metadata and extracted text in Neon first.
     try:
-        with get_postgres_connection() as connection:
-            connection.execute(
-                """
-                INSERT INTO public.documents (
-                    id, filename, file_type, size_bytes,
-                    extracted_text, created_at, indexing_status
+        filename = (file.filename or "").replace("\\", "/").split("/")[-1]
+        extension = Path(filename).suffix.lower()
+
+        if not filename or extension not in ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=415,
+                detail="Supported formats are PDF, TXT, and Markdown.",
+            )
+
+        file_bytes = await file.read(MAX_FILE_SIZE + 1)
+
+        if not file_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded file is empty.",
+            )
+
+        if len(file_bytes) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail="File exceeds the 10 MB limit.",
+            )
+
+        text = extract_text(filename, file_bytes)
+        document_id = str(uuid.uuid4())
+        created_at = datetime.now(timezone.utc)
+
+        # Save metadata and extracted text before indexing.
+        try:
+            with get_postgres_connection() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO public.documents (
+                        id, filename, file_type, size_bytes,
+                        extracted_text, created_at, indexing_status
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, 'pending')
+                    """,
+                    (
+                        document_id,
+                        filename,
+                        extension[1:],
+                        len(file_bytes),
+                        text,
+                        created_at,
+                    ),
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, 'pending')
-                """,
-                (
-                    document_id,
-                    filename,
-                    extension[1:],
-                    len(file_bytes),
-                    text,
-                    created_at,
-                ),
+        except psycopg.Error as exc:
+            logger.exception("Document metadata storage failed")
+            raise HTTPException(
+                status_code=503,
+                detail="Document storage is temporarily unavailable.",
+            ) from exc
+
+        indexed_chunks = 0
+        indexing_status = "pending"
+
+        try:
+            indexed_chunks = index_document(document_id, filename, text)
+            indexing_status = "indexed"
+        except Exception:
+            logger.exception("Indexing failed for document %s", document_id)
+
+        # Record the indexing result.
+        try:
+            with get_postgres_connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE public.documents
+                    SET indexing_status = %s
+                    WHERE id = %s
+                    """,
+                    (indexing_status, document_id),
+                )
+        except psycopg.Error:
+            logger.exception(
+                "Could not update indexing status for document %s",
+                document_id,
             )
-    except psycopg.Error as exc:
-        logger.exception("Document metadata storage failed")
-        raise HTTPException(
-            status_code=503,
-            detail="Document storage is temporarily unavailable.",
-        ) from exc
+            indexing_status = "pending"
 
-    indexed_chunks = 0
-    indexing_status = "pending"
+        return {
+            "id": document_id,
+            "filename": filename,
+            "file_type": extension[1:],
+            "size_bytes": len(file_bytes),
+            "indexing_status": indexing_status,
+            "indexed_chunks": indexed_chunks,
+        }
 
-    try:
-        indexed_chunks = index_document(document_id, filename, text)
-        indexing_status = "indexed"
-    except Exception:
-        logger.exception("Indexing failed for document %s", document_id)
-
-    # Update the indexing status after indexing succeeds or fails.
-    try:
-        with get_postgres_connection() as connection:
-            connection.execute(
-                """
-                UPDATE public.documents
-                SET indexing_status = %s
-                WHERE id = %s
-                """,
-                (indexing_status, document_id),
-            )
-    except psycopg.Error:
-        logger.exception("Could not update indexing status for %s", document_id)
-
-    return {
-        "id": document_id,
-        "filename": filename,
-        "file_type": extension[1:],
-        "size_bytes": len(file_bytes),
-        "text_characters": len(text),
-        "preview": text[:300],
-        "created_at": created_at.isoformat(),
-        "indexing_status": indexing_status,
-        "indexed_chunks": indexed_chunks,
-    }
+    finally:
+        await file.close()
 
 
 @app.get("/documents")
@@ -436,12 +486,34 @@ def retrieve_hybrid_candidates(query: str, query_embedding: list[float], pool_li
                  c.id
         LIMIT %s
     """
+
+    connection_start = time.perf_counter()
     with get_postgres_connection() as connection:
-        return connection.execute(
+        connection_seconds = time.perf_counter() - connection_start
+
+        query_start = time.perf_counter()
+        rows = connection.execute(
             sql,
-            (query_embedding, query_embedding, query_embedding,
-             query, query, query, pool_limit),
+            (
+                query_embedding,
+                query_embedding,
+                query_embedding,
+                query,
+                query,
+                query,
+                pool_limit,
+            ),
         ).fetchall()
+        query_seconds = time.perf_counter() - query_start
+
+    logger.info(
+        "Database breakdown: connection_setup=%.3fs sql_execution=%.3fs rows=%d",
+        connection_seconds,
+        query_seconds,
+        len(rows),
+    )
+    return rows
+
 
 
 
@@ -457,6 +529,7 @@ def filter_and_deduplicate_rows(
     """
     kept = []
     seen = set()
+
 
     for row in rows:
         document_id = row[0]
@@ -519,16 +592,28 @@ def semantic_search(request: SearchRequest):
             detail="Search query cannot be empty.",
         )
 
-    query_embedding = embed_query_or_http_error(query)
 
+    embedding_start = time.perf_counter()
+    query_embedding = embed_query_or_http_error(query)
+    embedding_seconds = time.perf_counter() - embedding_start
+
+    search_start = time.perf_counter()
     try:
         rows = retrieve_hybrid_candidates(query, query_embedding)
+        database_search_seconds = time.perf_counter() - search_start
     except (psycopg.Error, RuntimeError, ValueError) as exc:
+        database_search_seconds = time.perf_counter() - search_start
         logger.exception("Hybrid search database operation failed")
         raise HTTPException(
             status_code=503,
             detail="Search database is unavailable. Check server configuration.",
         ) from exc
+
+    logger.info(
+        "Search timing: embedding=%.3fs database_search=%.3fs",
+        embedding_seconds,
+        database_search_seconds,
+    )
 
     filtered_rows = filter_and_deduplicate_rows(rows)
 
@@ -573,6 +658,7 @@ class AskRequest(BaseModel):
 
 
 @app.post("/ask")
+
 def ask_question(request: AskRequest):
     question = request.question.strip()
     if not question:
@@ -621,6 +707,7 @@ def ask_question(request: AskRequest):
 
         # Display each document only once.
         # Rows are ranked, so the first chunk is the highest-ranked one.
+
         if document_id in seen_source_ids:
             continue
 

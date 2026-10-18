@@ -1,0 +1,31 @@
+
+[
+  {
+    "id": "orion_exact",
+    "question": "What is the internal launch code used by Project Orion?",
+    "expected_filename": "neon-upload-test.txt",
+    "expected_to_find_source": true,
+    "category": "exact_retrieval"
+  },
+  {
+    "id": "orion_paraphrase",
+    "question": "Which secret phrase identifies the Orion project launch?",
+    "expected_filename": "neon-upload-test.txt",
+    "expected_to_find_source": true,
+    "category": "semantic_retrieval"
+  },
+  {
+    "id": "resume_qualification",
+    "question": "What qualification is Suraj Prajapati pursuing?",
+    "expected_filename": "Suraj_Prajapati_Resume.pdf",
+    "expected_to_find_source": true,
+    "category": "document_retrieval"
+  },
+  {
+    "id": "unsupported_general_knowledge",
+    "question": "Who is the Prime Minister of India?",
+    "expected_filename": null,
+    "expected_to_find_source": false,
+    "category": "unsupported_question"
+  }
+]
