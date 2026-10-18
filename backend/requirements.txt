@@ -6,3 +6,4 @@ psycopg[binary]
 pgvector
 python-dotenv
 google-genai
+psycopg-pool
