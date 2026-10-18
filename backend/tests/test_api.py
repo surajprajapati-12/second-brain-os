@@ -689,3 +689,9 @@ def test_upload_runs_real_indexing_pipeline(mock_db, monkeypatch):
         if "INSERT INTO document_chunks" in sql
     ]
     assert len(inserts) == len(expected_chunks)
+def test_get_document_returns_404_when_document_does_not_exist():
+    response = client.get(
+        "/documents/00000000-0000-0000-0000-000000000000"
+    )
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Document not found."}
