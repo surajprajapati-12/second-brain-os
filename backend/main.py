@@ -167,26 +167,6 @@ def get_postgres_pool():
 
 def get_postgres_connection():
     return get_postgres_pool().connection()
-    required_settings = ["PGHOST", "PGDATABASE", "PGUSER", "PGPASSWORD"]
-    missing = [key for key in required_settings if not os.getenv(key)]
-    if missing:
-        raise RuntimeError(
-            "PostgreSQL configuration is incomplete. Check backend/.env."
-        )
-
-    connection = psycopg.connect(
-        host=os.environ["PGHOST"],
-        port=int(os.getenv("PGPORT", "5432")),
-        dbname=os.environ["PGDATABASE"],
-        user=os.environ["PGUSER"],
-        password=os.environ["PGPASSWORD"],
-        connect_timeout=5,
-        sslmode="require",
-    )
-    register_vector(connection)
-    return connection
-
-
 def split_text(text: str) -> list[str]:
     """Split text into overlapping character-based chunks."""
     text = text.strip()
