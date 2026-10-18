@@ -615,3 +615,77 @@ def test_index_document_chunks_embeds_and_saves_chunks(
         assert params[2] == index
         assert params[3] == expected_chunks[index]
         assert params[4] == fake_embedding
+@patch("backend.main.get_postgres_connection")
+def test_upload_runs_real_indexing_pipeline(mock_db, monkeypatch):
+    connection = MagicMock()
+    mock_db.return_value.__enter__.return_value = connection
+
+    embedding_calls = []
+
+    def fake_generate_embeddings(chunks):
+        embedding_calls.extend(chunks)
+        return [
+            [0.1] * main.EMBEDDING_DIMENSIONS
+            for _ in chunks
+        ]
+
+    monkeypatch.setattr(
+        main,
+        "generate_embeddings",
+        fake_generate_embeddings,
+    )
+
+    content = (
+        b"Second Brain integration testing. "
+        * ((main.CHUNK_SIZE // 10) + 20)
+    )
+
+    response = client.post(
+        "/documents",
+        files={"file": ("pipeline-test.txt", content, "text/plain")},
+    )
+
+    assert response.status_code == 201
+
+    data = response.json()
+    expected_text = content.decode("utf-8")
+    expected_chunks = main.split_text(expected_text)
+
+    assert data["filename"] == "pipeline-test.txt"
+    assert data["indexing_status"] == "indexed"
+    assert data["indexed_chunks"] == len(expected_chunks)
+    assert len(expected_chunks) >= 2
+    assert embedding_calls == expected_chunks
+
+    # Verify that metadata was saved and indexing status was updated.
+    sql_statements = [
+        call.args[0]
+        for call in connection.execute.call_args_list
+    ]
+
+    assert any(
+        "INSERT INTO public.documents" in sql
+        for sql in sql_statements
+    )
+    assert any(
+        "UPDATE public.documents" in sql
+        for sql in sql_statements
+    )
+
+    # Verify that real indexing deleted old chunks and inserted replacements.
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor_sql = [
+        call.args[0]
+        for call in cursor.execute.call_args_list
+    ]
+
+    assert any(
+        "DELETE FROM document_chunks" in sql
+        for sql in cursor_sql
+    )
+
+    inserts = [
+        sql for sql in cursor_sql
+        if "INSERT INTO document_chunks" in sql
+    ]
+    assert len(inserts) == len(expected_chunks)
